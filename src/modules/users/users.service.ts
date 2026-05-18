@@ -46,4 +46,14 @@ export class UsersService {
   async verifyUser(email: string): Promise<void> {
     await this.userModel.updateOne({ email }, { isVerified: true }).exec();
   }
+
+  async updatePassword(userId: any, password: string): Promise<void> {
+    await this.userModel.findByIdAndUpdate(userId, { password }).exec();
+  }
+
+  async updateProfile(userId: string, updateData: Partial<User>): Promise<UserDocument | null> {
+    return this.userModel
+      .findByIdAndUpdate(userId, { $set: updateData }, { new: true })
+      .exec();
+  }
 }

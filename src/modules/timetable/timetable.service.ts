@@ -1,4 +1,356 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, BadRequestException, Logger, OnModuleInit } from '@nestjs/common';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model, Types } from 'mongoose';
+import { Timetable, TimetableDocument } from './schemas/timetable.schema';
+import { GenerateTimetableDto } from './dto/generate-timetable.dto';
+import { validateTimetableInput } from './helpers/validation.helper';
+import { generateSmartTimetable } from './helpers/timetable.helper';
 
 @Injectable()
-export class TimetableService {}
+export class TimetableService implements OnModuleInit {
+  private readonly logger = new Logger(TimetableService.name);
+
+  constructor(
+    @InjectModel(Timetable.name)
+    private readonly timetableModel: Model<TimetableDocument>,
+  ) {}
+
+  /**
+   * Automatically executes on bootstrap. Cleans up expired timetables immediately 
+   * and schedules the cleanup to run every 24 hours.
+   */
+  async onModuleInit() {
+    this.logger.log('TimetableService initialized. Running initial expired timetables cleanup.');
+    await this.cleanupExpiredTimetables();
+
+    // Set daily check interval (24 hours = 86,400,000 milliseconds)
+    setInterval(async () => {
+      this.logger.log('Triggering daily scheduled cleanup of expired timetables.');
+      await this.cleanupExpiredTimetables();
+    }, 86400000);
+  }
+
+  /**
+   * Scans the database for timetables where the current time is past expiresAt,
+   * then removes them permanently from MongoDB.
+   */
+  async cleanupExpiredTimetables(): Promise<void> {
+    try {
+      const now = new Date();
+      const result = await this.timetableModel.deleteMany({
+        expiresAt: { $lt: now }
+      }).exec();
+
+      if (result.deletedCount > 0) {
+        this.logger.log(`Cleanup system: Automatically deleted ${result.deletedCount} expired timetables from database.`);
+      } else {
+        this.logger.log('Cleanup system: Verified database. No expired timetables found.');
+      }
+    } catch (error) {
+      this.logger.error('Cleanup system: Failed to clear expired timetables.', error.stack);
+    }
+  }
+
+  /**
+   * Generates a new smart timetable, calls AI for study tips, and saves it in MongoDB.
+   */
+  async generate(userId: string, dto: GenerateTimetableDto): Promise<Timetable> {
+    // 0. Manual check for Timetable Name to support high-safety validation toasts
+    if (!dto.timetableName || !dto.timetableName.trim()) {
+      throw new BadRequestException('Please enter a timetable name.');
+    }
+
+    // 1. Validate Form Inputs with Strict Business Rules
+    const validationResult = validateTimetableInput({
+      subjects: dto.subjects,
+      studyHours: dto.studyHours,
+      hasSchool: dto.hasSchool,
+      schoolStartTime: dto.schoolStartTime,
+      schoolEndTime: dto.schoolEndTime,
+    });
+
+    if (!validationResult.isValid) {
+      throw new BadRequestException(validationResult.errors.join(' | '));
+    }
+
+    // Filter out rows that do not have a subject (just in case frontend sent trailing empty rows)
+    const activeSubjects = dto.subjects.filter(
+      (s) => s.subject && s.date && s.selectedChapters && s.selectedChapters.length > 0
+    );
+
+    // 2. Run the Deterministic Scheduler Algorithm
+    const generatedDays = generateSmartTimetable({
+      subjects: activeSubjects,
+      studyHours: dto.studyHours,
+      hasSchool: dto.hasSchool,
+      schoolStartTime: dto.schoolStartTime,
+      schoolEndTime: dto.schoolEndTime,
+    });
+
+    // 3. Fetch AI Study Tips, suggestions and quotes using Gemini AI (with a premium static fallback)
+    const aiInsight = await this.getAiStudyInsights(activeSubjects, Number(dto.studyHours));
+
+    // Calculate dates: expiresAt (latest exam date + 1 day at midnight) and nearestExamDate
+    const examDates = activeSubjects
+      .map((s) => new Date(s.date))
+      .sort((a, b) => a.getTime() - b.getTime());
+
+    const nearestExamDate = examDates.length > 0 ? examDates[0] : new Date();
+    const latestExamDate = examDates.length > 0 ? examDates[examDates.length - 1] : new Date();
+
+    const expiresAt = new Date(latestExamDate);
+    expiresAt.setDate(expiresAt.getDate() + 1);
+    expiresAt.setHours(0, 0, 0, 0); // Expires midnight following the last exam
+
+    // 4. Save the generated timetable in the Database
+    const newTimetable = new this.timetableModel({
+      userId: new Types.ObjectId(userId),
+      timetableName: dto.timetableName.trim(),
+      expiresAt,
+      nearestExamDate,
+      subjects: activeSubjects,
+      dailyStudyHours: Number(dto.studyHours),
+      schoolTiming: {
+        hasSchool: dto.hasSchool,
+        schoolStartTime: dto.schoolStartTime,
+        schoolEndTime: dto.schoolEndTime,
+      },
+      generatedTimetable: generatedDays,
+      tips: aiInsight.tips,
+      suggestions: aiInsight.suggestions,
+      motivationalQuote: aiInsight.motivationalQuote,
+      generatedAt: new Date(),
+    });
+
+    return await newTimetable.save();
+  }
+
+  /**
+   * Retrieves all ACTIVE (unexpired) timetables generated by a student.
+   */
+  async findAll(userId: string): Promise<TimetableDocument[]> {
+    const now = new Date();
+    return await this.timetableModel
+      .find({
+        userId: new Types.ObjectId(userId),
+        expiresAt: { $gte: now }
+      })
+      .sort({ generatedAt: -1 })
+      .exec();
+  }
+
+  /**
+   * Retrieves a single active timetable by ID.
+   */
+  async findOne(userId: string, id: string): Promise<TimetableDocument> {
+    const timetable = await this.timetableModel
+      .findOne({
+        _id: new Types.ObjectId(id),
+        userId: new Types.ObjectId(userId)
+      })
+      .exec();
+
+    if (!timetable) {
+      throw new BadRequestException('Timetable not found or access denied.');
+    }
+
+    const now = new Date();
+    if (timetable.expiresAt < now) {
+      throw new BadRequestException('This timetable has expired and is no longer available.');
+    }
+
+    return timetable;
+  }
+
+  /**
+   * Retrieves the latest active timetable for a student.
+   */
+  async getLatest(userId: string): Promise<TimetableDocument | null> {
+    const now = new Date();
+    return await this.timetableModel
+      .findOne({ 
+        userId: new Types.ObjectId(userId),
+        expiresAt: { $gte: now }
+      })
+      .sort({ generatedAt: -1 })
+      .exec();
+  }
+
+  /**
+   * Toggles the completion status of a specific task within a study day.
+   */
+  async toggleTaskCompletion(
+    userId: string,
+    timetableId: string,
+    dateStr: string,
+    subject: string,
+    chapter: string,
+  ): Promise<TimetableDocument> {
+    const timetable = await this.timetableModel.findOne({
+      _id: new Types.ObjectId(timetableId),
+      userId: new Types.ObjectId(userId)
+    }).exec();
+
+    if (!timetable) {
+      throw new BadRequestException('No timetable found with the provided ID.');
+    }
+
+    const now = new Date();
+    if (timetable.expiresAt < now) {
+      throw new BadRequestException('This timetable has expired and cannot be modified.');
+    }
+
+    // Locate the matching date card
+    const day = timetable.generatedTimetable.find((d) => d.date === dateStr);
+    if (!day) {
+      throw new BadRequestException(`Schedule date ${dateStr} not found.`);
+    }
+
+    // Locate the matching task
+    const task = day.tasks.find(
+      (t) => t.subject === subject && t.chapter === chapter
+    );
+
+    if (!task) {
+      throw new BadRequestException(`Task for subject ${subject} and chapter ${chapter} not found.`);
+    }
+
+    // Toggle completion status
+    task.completed = !task.completed;
+
+    // Save update
+    await timetable.save();
+    return timetable;
+  }
+
+  /**
+   * Interacts with Gemini API to fetch personalized study tips, suggestions and quotes.
+   * Leverages robust static fallbacks if the key is missing or the external API call fails.
+   */
+  private async getAiStudyInsights(
+    subjects: any[],
+    studyHours: number,
+  ): Promise<{ tips: string[]; suggestions: string[]; motivationalQuote: string }> {
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+
+    if (!apiKey) {
+      this.logger.warn('GEMINI_API_KEY or GOOGLE_API_KEY not configured. Utilizing high-quality fallback generator.');
+      return this.generateFallbackInsights(subjects, studyHours);
+    }
+
+    const subjectDetails = subjects
+      .map((s) => `${s.subject} (Exam: ${s.date}, Chapters: ${s.selectedChapters.join(', ')})`)
+      .join('; ');
+
+    const prompt = `
+You are EduMitra AI, an elite educational planner designed specifically for GSEB board students.
+A student is preparing for the following exams:
+${subjectDetails}
+
+They will study for ${studyHours} hours daily.
+
+Provide 3 custom, actionable study tips for their subjects, 2 smart scheduling/study technique suggestions (such as Spaced Repetition, Active Recall, Pomodoro), and 1 inspiring motivational quote.
+
+You must respond ONLY with a valid JSON object in this exact structure:
+{
+  "tips": [
+    "Tip 1 (tailored to their subjects)",
+    "Tip 2 (tailored to their subjects)",
+    "Tip 3 (tailored to their subjects)"
+  ],
+  "suggestions": [
+    "Suggestion 1 (learning style or scheduling technique)",
+    "Suggestion 2 (learning style or scheduling technique)"
+  ],
+  "motivationalQuote": "A single highly inspiring and specific motivational quote."
+}
+
+Do not include any markdown code blocks, backticks (e.g. \`\`\`json), or conversational pre-text or post-text. Return only raw JSON.
+`;
+
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [{ text: prompt }],
+              },
+            ],
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(`Gemini API returned status code ${response.status}`);
+      }
+
+      const result = await response.json();
+      const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!text) {
+        throw new Error('Empty response from Gemini API.');
+      }
+
+      // Clean markdown code blocks from response if present
+      let cleanedText = text.trim();
+      if (cleanedText.startsWith('```')) {
+        cleanedText = cleanedText
+          .replace(/^```json\s*/, '')
+          .replace(/```$/, '')
+          .trim();
+      }
+
+      const parsed = JSON.parse(cleanedText);
+
+      return {
+        tips: Array.isArray(parsed.tips) ? parsed.tips : this.generateFallbackInsights(subjects, studyHours).tips,
+        suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : this.generateFallbackInsights(subjects, studyHours).suggestions,
+        motivationalQuote: parsed.motivationalQuote || this.generateFallbackInsights(subjects, studyHours).motivationalQuote,
+      };
+    } catch (error) {
+      this.logger.error('Failed to retrieve or parse AI insights from Gemini. Falling back to structured insights.', error.stack);
+      return this.generateFallbackInsights(subjects, studyHours);
+    }
+  }
+
+  /**
+   * Fallback engine for creating tailored study tips and quotes locally.
+   */
+  private generateFallbackInsights(
+    subjects: any[],
+    studyHours: number,
+  ): { tips: string[]; suggestions: string[]; motivationalQuote: string } {
+    const tips = [
+      'Focus heavily on active recall and self-testing for high-weightage GSEB textbook questions.',
+      'Maintain a dedicated formula book and revision sheet. Math & Science require daily practical solving.',
+      'Take structured 10-minute breaks every 50 minutes of deep-focus learning to let your brain consolidate information.',
+    ];
+
+    const suggestions = [
+      'Use the Feynman Technique: Try to explain complex chapters (like quantum physics or geometry concepts) to an imaginary student to identify gaps in your knowledge.',
+      'Allocate early morning hours for conceptual reading (like Science/English literature) when your mind is freshest.',
+    ];
+
+    const motivationalQuote = 'Success is the sum of small efforts, repeated day in and day out. Your hard work today secures your board victory!';
+
+    // Customize tips slightly if specific subjects are present
+    const subjectNames = subjects.map((s) => s.subject.toLowerCase());
+    if (subjectNames.some((n) => n.includes('math'))) {
+      tips[1] = 'For Mathematics, do not just read solved examples. Solve at least 8-10 exercises from board papers daily to build muscle memory.';
+    } else if (subjectNames.some((n) => n.includes('science'))) {
+      tips[1] = 'For Science, practice biological diagrams and chemical reaction balancing. Draw them twice from memory.';
+    }
+
+    return {
+      tips,
+      suggestions,
+      motivationalQuote,
+    };
+  }
+}
